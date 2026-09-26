@@ -1,0 +1,11 @@
+# Pinned dependencies for the Business Entity Resolution pipeline.
+# All permissively licensed (BSD-3-Clause / MIT), which satisfies the
+# challenge rule that the final model be MIT/Apache-2.0 licensed and
+# far under the 8B-parameter ceiling (this is a ~40-parameter linear model).
+#
+# Install:  pip install -r requirements.txt
+#
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+rapidfuzz==3.14.6
