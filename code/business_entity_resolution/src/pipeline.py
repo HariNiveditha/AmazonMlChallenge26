@@ -521,6 +521,9 @@ def score_chunk(
     feat_rows: list[np.ndarray] = []
     feat_owner: list[tuple[int, int, int]] = []   # (local_row, store_i, row)
 
+    # Target cache for the chunk: (store_i, local_row) -> (NameFeatures, AddressFeatures)
+    target_cache: dict[tuple[int, int], tuple] = {}
+
     for local, qi in enumerate(range(start, end)):
         qn, qa = _derive_query(s1, qi)
         q_country = country_string(s1, qi)
@@ -534,17 +537,25 @@ def score_chunk(
                 s1.name_of(qi), s1.addr_of(qi), max_candidates=per_store_cap,
             )
             for r in rows:
-                tid = store.id_of(int(r))
+                r_int = int(r)
+                tid = store.id_of(r_int)
                 if tid in seen:
                     continue
                 seen.add(tid)
                 hit_ids.append(tid)
-                tn, ta = _derive_target(store, int(r))
+                
+                cache_key = (si, r_int)
+                cached_target = target_cache.get(cache_key)
+                if cached_target is None:
+                    cached_target = _derive_target(store, r_int)
+                    target_cache[cache_key] = cached_target
+                tn, ta = cached_target
+                
                 feat_rows.append(
                     pair_features(qn, qa, q_country, tn, ta,
-                                  targets.country_of(si, int(r)), stats)
+                                  targets.country_of(si, r_int), stats)
                 )
-                feat_owner.append((local, si, int(r)))
+                feat_owner.append((local, si, r_int))
 
         if not hit_ids:
             continue
