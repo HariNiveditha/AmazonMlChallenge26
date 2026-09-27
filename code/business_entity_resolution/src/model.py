@@ -72,6 +72,34 @@ def macro_f05(
     return float(np.mean(scores)) if scores else 0.0
 
 
+def macro_pr(
+    y_true: dict[str, set[str]],
+    y_pred: dict[str, set[str]],
+) -> tuple[float, float]:
+    """Macro-averaged (precision, recall) over Source 1 entities.
+
+    Same per-entity averaging as macro_f05 (singletons: empty vs empty
+    counts as P=R=1.0; predicted-nonempty vs empty truth counts as P=0
+    with recall undefined -> 0.0 contribution matching f_beta's limit).
+    """
+    if not y_true:
+        return 0.0, 0.0
+    ps: list[float] = []
+    rs: list[float] = []
+    for s1_id, truth in y_true.items():
+        pred = y_pred.get(s1_id, set())
+        if not truth and not pred:
+            ps.append(1.0)
+            rs.append(1.0)
+            continue
+        tp = len(truth & pred)
+        fp = len(pred - truth)
+        fn = len(truth - pred)
+        ps.append(tp / (tp + fp) if (tp + fp) else 0.0)
+        rs.append(tp / (tp + fn) if (tp + fn) else 0.0)
+    return float(np.mean(ps)), float(np.mean(rs))
+
+
 def f05_at_threshold(
     scores_by_row: dict[str, list[tuple[str, float]]],
     y_true: dict[str, set[str]],
@@ -83,6 +111,35 @@ def f05_at_threshold(
         chosen = {cid for cid, sc in cands if sc >= threshold}
         y_pred[s1_id] = chosen
     return macro_f05(y_true, y_pred), y_pred
+
+
+def prior_correct_proba(
+    p: np.ndarray,
+    tau: float,
+    y_bar: float,
+) -> np.ndarray:
+    """Manski-McFadden correction for choice-based (case-control) sampling.
+
+    Training sees positives at rate ``y_bar`` while blocking candidates
+    carry positives at rate ``tau``. A model fitted on the sample returns
+    ``p = P_sample(y=1|x)``; the population probability is recovered from
+    the odds identity (King & Zeng 2001; Manski-McFadden)::
+
+        P_pop = p / (p + (1 - p) * F),  F = ((1-tau)/tau) * (y_bar/(1-y_bar))
+
+    i.e. sample odds are *divided* by F (oversampled positives, y_bar >
+    tau, push probabilities DOWN). Identity when ``tau == y_bar`` (no
+    sampling shift). Inputs are clipped to (eps, 1 - eps) so the odds are
+    always finite. Pure function -- safe to unit-test without a model.
+    """
+    eps = 1e-12
+    if not (0.0 < tau < 1.0) or not (0.0 < y_bar < 1.0):
+        return np.asarray(p, dtype=np.float64)
+    p = np.clip(np.asarray(p, dtype=np.float64), eps, 1.0 - eps)
+    odds = p / (1.0 - p)
+    f = ((1.0 - tau) / tau) * (y_bar / (1.0 - y_bar))
+    corrected = odds / f
+    return corrected / (1.0 + corrected)
 
 
 # --------------------------------------------------------------------------
@@ -97,6 +154,13 @@ class MatchingModel:
         self.threshold = cfg.threshold
         self.kind = "heuristic"
         self._clf = None
+        self._booster = None       # batch tree model (hgb / lightgbm / xgboost)
+        self._booster_kind: str | None = None
+        # Choice-based-sampling correction terms, estimated at train time.
+        # tau   = P(y=1) among blocking candidates (population rate)
+        # y_bar = P(y=1) in the downsampled training sample
+        self.tau: float | None = None
+        self.y_bar: float | None = None
         self._mu: np.ndarray | None = None
         self._sd: np.ndarray | None = None
         self._heuristic_w: np.ndarray | None = None
@@ -319,11 +383,118 @@ class MatchingModel:
         self._stream_n = getattr(self, "_stream_n", 0) + int(len(y))
         return int(len(y))
 
+    # -- batch tree-model training -----------------------------------------
+
+    TREE_KINDS = ("hgb", "lightgbm", "xgboost", "catboost")
+
+    def fit_batch(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        tau: float | None = None,
+        y_bar: float | None = None,
+    ) -> dict:
+        """Fit a nonlinear batch model on a bounded (X, y) buffer.
+
+        Used when ``cfg.model_type`` is one of ``TREE_KINDS``. ``X`` is
+        expected to already carry the pipeline's 4:1 negative sampling;
+        ``tau``/``y_bar`` record the sampling rates for the optional
+        prior correction at inference time. Raises ImportError with a
+        clear message when lightgbm/xgboost is requested but missing.
+        """
+        kind = getattr(self.cfg, "model_type", "sgd")
+        if kind not in self.TREE_KINDS:
+            raise ValueError(f"fit_batch needs a tree model_type, got {kind!r}")
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.int64)
+        report: dict = {"n_samples": int(len(y)), "n_positive": int(y.sum())}
+        if len(np.unique(y)) < 2 or len(y) < 50:
+            self._init_heuristic()
+            report["mode"] = "heuristic (insufficient class balance)"
+            report["threshold"] = self.threshold
+            return report
+        rs = self.cfg.random_state
+        n_pos = int(y.sum())
+        spw = (len(y) - n_pos) / max(n_pos, 1)
+        if kind == "hgb":
+            from sklearn.ensemble import HistGradientBoostingClassifier
+            booster = HistGradientBoostingClassifier(
+                max_iter=200, learning_rate=0.06, max_leaf_nodes=31,
+                min_samples_leaf=50, l2_regularization=1.0,
+                class_weight="balanced", random_state=rs,
+            )
+        elif kind == "lightgbm":
+            try:
+                from lightgbm import LGBMClassifier
+            except ImportError as exc:
+                raise ImportError(
+                    "model_type='lightgbm' needs `pip install lightgbm`"
+                ) from exc
+            booster = LGBMClassifier(
+                n_estimators=300, learning_rate=0.05, num_leaves=63,
+                min_child_samples=100, reg_lambda=1.0,
+                class_weight="balanced", random_state=rs,
+                deterministic=True, n_jobs=1, verbose=-1,
+            )
+        elif kind == "xgboost":
+            try:
+                from xgboost import XGBClassifier
+            except ImportError as exc:
+                raise ImportError(
+                    "model_type='xgboost' needs `pip install xgboost`"
+                ) from exc
+            booster = XGBClassifier(
+                n_estimators=300, learning_rate=0.05, max_depth=6,
+                min_child_weight=50, reg_lambda=1.0,
+                scale_pos_weight=spw, random_state=rs,
+                tree_method="hist", n_jobs=1,
+            )
+        else:  # catboost
+            try:
+                from catboost import CatBoostClassifier
+            except ImportError as exc:
+                raise ImportError(
+                    "model_type='catboost' needs `pip install catboost`"
+                ) from exc
+            booster = CatBoostClassifier(
+                iterations=300, learning_rate=0.05, depth=6,
+                min_data_in_leaf=100, l2_leaf_reg=3.0,
+                auto_class_weights="Balanced", random_seed=rs,
+                thread_count=1, verbose=False, allow_writing_files=False,
+            )
+        booster.fit(X, y)
+        self._booster = booster
+        self._booster_kind = kind
+        self.kind = f"tree_{kind}"
+        self.tau = tau
+        self.y_bar = float(y.mean())
+        report["mode"] = self.kind
+        report["n_features"] = int(X.shape[1])
+        report["tau"] = tau
+        report["y_bar"] = self.y_bar
+        try:
+            importances = np.asarray(booster.feature_importances_, dtype=float)
+            top = sorted(zip(FEATURE_NAMES, importances.tolist()),
+                         key=lambda kv: kv[1], reverse=True)[:12]
+            report["top_features"] = [{k: round(v, 4) for k, v in top}]
+        except Exception:                            # noqa: BLE001
+            pass
+        return report
+
     # -- inference ---------------------------------------------------------
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if X.size == 0:
             return np.zeros(0, dtype=np.float64)
+        if self._booster is not None:
+            probs = np.asarray(
+                self._booster.predict_proba(X.astype(np.float64))[:, 1],
+                dtype=np.float64,
+            )
+            if getattr(self.cfg, "prior_correct", False):
+                probs = prior_correct_proba(probs, self.tau or 0.0, self.y_bar or 0.0)
+            return probs
         if self._clf is not None:
             if (self.kind == "sgd_logistic_regression"
                     and not getattr(self, "_stream_started", False)):
@@ -381,6 +552,9 @@ class MatchingModel:
             "kind": self.kind,
             "threshold": self.threshold,
             "feature_names": self._feature_names,
+            "booster_kind": self._booster_kind,
+            "tau": self.tau,
+            "y_bar": self.y_bar,
             "heuristic_norm": float(getattr(self, "_heuristic_norm", 1.0)),
             "heuristic_center": float(getattr(self, "_heuristic_center", 0.5)),
             "heuristic_slope": float(getattr(self, "_heuristic_slope", 10.0)),
@@ -397,6 +571,12 @@ class MatchingModel:
                 "coef": self._clf.coef_.tolist(),
                 "intercept": self._clf.intercept_.tolist(),
             }
+        if self._booster is not None:
+            import pickle
+            bpath = path.parent / (path.stem + ".booster.pkl")
+            with bpath.open("wb") as fh:
+                pickle.dump(self._booster, fh, protocol=4)
+            payload["booster_file"] = bpath.name
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         log.info("Saved model (%s) to %s", self.kind, path)
 
@@ -410,11 +590,15 @@ class MatchingModel:
         model._heuristic_norm = float(payload.get("heuristic_norm", 1.0))
         model._heuristic_center = float(payload.get("heuristic_center", 0.5))
         model._heuristic_slope = float(payload.get("heuristic_slope", 10.0))
+        model._booster_kind = payload.get("booster_kind")
+        model.tau = payload.get("tau")
+        model.y_bar = payload.get("y_bar")
         hw = payload.get("heuristic_weights")
         model._heuristic_w = None if hw is None else np.asarray(hw, dtype=np.float64)
         model._mu = None if payload.get("mean") is None else np.asarray(payload["mean"])
         model._sd = None if payload.get("std") is None else np.asarray(payload["std"])
 
+        restored = False
         lr = payload.get("logreg")
         if lr:
             try:
@@ -431,10 +615,34 @@ class MatchingModel:
                 clf.intercept_ = intercept
                 clf.n_features_in_ = coef.shape[1]
                 model._clf = clf
-                model.kind = "logistic_regression"
+                restored = True
             except Exception as exc:            # pragma: no cover
-                log.warning("Could not restore logistic model (%s); using heuristic.", exc)
-                model._init_heuristic()
-        elif model._heuristic_w is None:
+                log.warning("Could not restore logistic model (%s).", exc)
+                model._clf = None
+        bf = payload.get("booster_file")
+        if bf:
+            try:
+                import pickle
+                with (Path(path).parent / bf).open("rb") as fh:
+                    model._booster = pickle.load(fh)
+                restored = True
+            except Exception as exc:            # noqa: BLE001
+                log.warning("Could not restore tree booster (%s).", exc)
+                model._booster = None
+        if model._heuristic_w is not None:
+            restored = True
+        if not restored:
+            # No valid serialized state at all: fall back to the label-free
+            # heuristic. This branch must NEVER run after a successful
+            # restore, and kind/threshold below must not clobber one.
             model._init_heuristic()
+        # Restore kind/threshold LAST so no fallback can overwrite them.
+        # One faithful mapping: a streamed SGD session persists only its
+        # weights, which reload as a batch LogisticRegression object.
+        restored_kind = payload.get("kind", model.kind)
+        if restored_kind == "sgd_logistic_regression" and model._clf is not None:
+            restored_kind = "logistic_regression"
+        model.kind = restored_kind
+        if "threshold" in payload:
+            model.threshold = float(payload["threshold"])
         return model

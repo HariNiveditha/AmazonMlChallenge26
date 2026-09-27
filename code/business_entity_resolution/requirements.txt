@@ -9,3 +9,12 @@ numpy==2.5.3
 scipy==1.18.1
 scikit-learn==1.9.1
 rapidfuzz==3.14.6
+
+# --- Optional: nonlinear matchers (all opt-in via --model-type) -----------
+# The baseline (--model-type sgd) and --model-type hgb need nothing above.
+# Uncomment / install only what you benchmark:
+# lightgbm>=4.0      # --model-type lightgbm  (MIT)
+# xgboost>=2.0       # --model-type xgboost   (Apache-2.0)
+# catboost>=1.2      # --model-type catboost  (Apache-2.0)
+# All are permissively licensed; tree boosters used here have <1M
+# parameters, still far under the challenge 8B ceiling.

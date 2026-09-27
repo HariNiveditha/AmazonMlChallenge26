@@ -25,6 +25,11 @@ NAME_SUFFIXES = frozenset(
         "enterprises", "enterprise", "srl", "spa", "kg", "kgaa", "oao",
         "pvt", "kft", "zrt", "doo", "shpk", "mb", "srlu", "srl",
         "services", "service", "stores", "store", "solutions",
+        # French legal forms (test split contains France, unseen in train).
+        # Stripped only as trailing/leading tags for the *core* name view;
+        # the full form is retained for scoring, as with other suffixes.
+        "sas", "sasu", "sarl", "selarl", "selas", "sa", "sca", "scs",
+        "eurl", "eirl", "ei", "sci", "snc", "spa", "gie", "gmbh",
     }
 )
 
@@ -61,12 +66,15 @@ NAME_ABBREVS = {
 ADDRESS_ABBREVS = {
     # roads / thoroughfares
     "rd": "road", "st": "street", "ave": "avenue", "av": "avenue",
-    "a": "avenue", "blvd": "boulevard", "ln": "lane", "dr": "drive",
+    "a": "avenue", "blvd": "boulevard", "bd": "boulevard", "bvd": "boulevard",
+    "ln": "lane", "dr": "drive",
     "ct": "court", "cir": "circle", "pl": "place", "pkwy": "parkway",
     "hwy": "highway", "sq": "square", "ter": "terrace", "trl": "trail",
-    "rt": "route", "expy": "expressway", "fwy": "freeway",
+    "rt": "route", "rte": "route", "expy": "expressway", "fwy": "freeway",
     "xing": "crossing", "jnc": "junction", "grn": "green", "prt": "park",
     "plz": "plaza", "sq": "square", "way": "way",
+    # French thoroughfares (test split contains France)
+    "imp": "impasse", "fg": "faubourg", "chem": "chemin",
 
     # units / buildings
     "apt": "apartment", "ste": "suite", "rm": "room", "fl": "floor",
@@ -153,6 +161,19 @@ class PipelineConfig:
     # blocking determines the recall ceiling, so start here if F_0.5 looks
     # recall-capped.
     max_candidates_per_row: int = 80
+    # Soundex phonetic keys (first + longest name token). Opt-in: adds
+    # spelling-variant recall at extra fan-out. Measured per experiment.
+    phonetic_keys: bool = False
+    # Per-token name keys (t:) + address-first keys (x:). Targets NO_SHARED_KEY
+    # autopsy misses: a pair sharing ANY rare token matches, not just
+    # longest/first/last. Measured per experiment.
+    per_token_keys: bool = False
+    # Whole-group budget boundaries instead of row-id truncation (soft cap).
+    # Measured: soft-80 recall 0.7009 vs hard-80 0.6578. Opt-in.
+    soft_cap: bool = False
+    # MinHash LSH bands (16x4 over char 3/4-grams of the sorted core name).
+    # Opt-in approximate-similarity keys for typo/transliteration recall.
+    minhash_lsh: bool = False
     query_chunk: int = 5_000       # Source 1 rows held in flight at once
 
     # --- features ---------------------------------------------------------
@@ -162,14 +183,28 @@ class PipelineConfig:
     # --- model ------------------------------------------------------------
     # Optimised on the held-out validation split for macro F_0.5.
     threshold: float = 0.52
+    # Model family. "sgd" is the streaming baseline (unchanged behaviour).
+    # "hgb" (sklearn HistGradientBoosting, no new dependency), "lightgbm"
+    # and "xgboost" (optional imports) are batch-fitted on a bounded,
+    # deterministically subsampled pair buffer -- see gbm_max_pairs.
+    model_type: str = "sgd"
+    # Max (X, y) pairs buffered for batch tree-model fitting. 200k pairs x
+    # 37 float64 features ~= 60 MB. 0 = use everything buffered (not
+    # recommended at full-train scale).
+    gbm_max_pairs: int = 200_000
+    # Prior (choice-based-sample) correction for the 4:1 negative
+    # downsampling. OFF by default: the baseline threshold sweep already
+    # absorbs the sampling shift, and correction is only applied when
+    # tau/y_bar were estimated at train time (see model.py).
+    prior_correct: bool = False
     # Threshold used by the label-free heuristic scorer when there is no
     # ground truth to calibrate against.  Chosen on the precision-heavy
     # side, since F_0.5 weights precision 2x over recall.
     heuristic_threshold: float = 0.65
     calibrate_threshold: bool = True
     threshold_grid: tuple[float, ...] = tuple(
-        round(0.20 + 0.02 * i, 2) for i in range(31)
-    )
+        round(0.20 + 0.02 * i, 2) for i in range(40)
+    )  # 0.20 .. 0.98: precision-heavy optimum can sit at the top edge
     negative_ratio: float = 4.0    # negatives sampled per positive when training
     random_state: int = 42
 
@@ -178,14 +213,24 @@ class PipelineConfig:
     # makes threads useless here; process workers each memory-map the same
     # target blobs, costing one copy of the data rather than N.
     workers: int = 0            # 0 => use every logical core
+    # --- post-processing (all opt-in; baseline path untouched) -------------
+    evidence_gate: bool = False  # two-stage singleton guard (§6)
+    gate_high: float = 0.90      # ... best prob at/above this: accept as-is
+    graph_expand: bool = False   # one-hop evidence-gated expansion (§8)
+    graph_leg_thr: float = 0.90  # ... only legs this strong seed expansion
+    graph_max_expand: int = 5    # ... max new accepts per Source 1 row
     # Training/cap knobs.  A 37-feature linear model saturates well before
     # it has seen every Source 1 row, so both passes accept a row cap: the
     # cost is linear in rows, and these caps are what keep a full run inside
     # a couple of hours on 7.6 GB of RAM.  0 = use everything.
     train_rows: int = 300_000
     calib_rows: int = 50_000
+    # Three-way protocol: rows [calib_end, calib_end + test_rows) form a
+    # held-out TEST slice scored once with the locked (validation-chosen)
+    # threshold. Model/threshold selection uses the calib slice only; the
+    # test slice gives the unbiased estimate. 0 = disable.
+    test_rows: int = 30_000
     verbose: bool = True
-
     extra: dict = field(default_factory=dict)
 
     def tag(self) -> str:

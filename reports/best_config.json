@@ -1,0 +1,12 @@
+{
+ "model_type": "lightgbm",
+ "max_candidates": 200,
+ "df_cap": 60,
+ "threshold": 0.96,
+ "evidence_gate": false,
+ "graph_expand": false,
+ "val_macro_f05": 0.7942,
+ "test_macro_f05": 0.79402,
+ "source": "train-eval cap200 (measured)",
+ "status": "validation-best"
+}

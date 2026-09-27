@@ -40,7 +40,7 @@ import numpy as np
 from .blocking import KeyIndex
 from .config import PipelineConfig
 from .features import N_FEATURES, TokenStats, extract_features
-from .model import MatchingModel, f05_at_threshold, macro_f05
+from .model import MatchingModel, f05_at_threshold, macro_f05, macro_pr
 from .normalize import normalize_address, normalize_name
 from .store import (
     RecordStore,
@@ -500,6 +500,50 @@ def run_test(
     return report
 
 
+def _graph_expand(
+    model, s1, qi, qn, qa, q_country, targets, tid_pos,
+    keep, keep_probs, seen, cfg,
+) -> list[str]:
+    """One-hop evidence-gated expansion for a single query row.
+
+    For accepted matches at or above ``graph_leg_thr``, look up the matched
+    target's own blocking keys across both target stores; any *new* target
+    is scored directly against the query and returned iff it clears the
+    model threshold. Bounded by ``graph_max_expand`` new accepts per row.
+    Deterministic: legs processed best-first, new tids in sorted order.
+    """
+    added: list[str] = []
+    legs = sorted(
+        ((p, tid) for tid, p in zip(keep, keep_probs)
+         if p >= cfg.graph_leg_thr and tid in tid_pos),
+        reverse=True,
+    )[:2]
+    for _, tid in legs:
+        if len(added) >= cfg.graph_max_expand:
+            break
+        si_t, r_t = tid_pos[tid]
+        tname = targets.stores[si_t].name_of(r_t)
+        taddr = targets.stores[si_t].addr_of(r_t)
+        for si, (store, index) in enumerate(zip(targets.stores, targets.indexes)):
+            rows = index.candidates_for(
+                tname, taddr, max_candidates=cfg.graph_max_expand * 4,
+            )
+            for r in sorted(int(v) for v in rows):
+                if len(added) >= cfg.graph_max_expand:
+                    break
+                nid = store.id_of(r)
+                if nid in seen:
+                    continue
+                tn, ta = _derive_target(store, r)
+                x = pair_features(qn, qa, q_country, tn, ta,
+                                  targets.country_of(si, r), None)
+                if float(model.predict_proba(
+                        np.asarray([x], dtype=np.float32))[0]) >= model.threshold:
+                    seen.add(nid)
+                    added.append(nid)
+    return added
+
+
 def score_chunk(
     model: MatchingModel,
     s1: RecordStore,
@@ -521,14 +565,12 @@ def score_chunk(
     feat_rows: list[np.ndarray] = []
     feat_owner: list[tuple[int, int, int]] = []   # (local_row, store_i, row)
 
-    # Target cache for the chunk: (store_i, local_row) -> (NameFeatures, AddressFeatures)
-    target_cache: dict[tuple[int, int], tuple] = {}
-
     for local, qi in enumerate(range(start, end)):
         qn, qa = _derive_query(s1, qi)
         q_country = country_string(s1, qi)
 
         hit_ids: list[str] = []
+        tid_pos: dict[str, tuple[int, int]] = {}
         seen: set[str] = set()
         n_feat_before = len(feat_rows)
 
@@ -537,25 +579,18 @@ def score_chunk(
                 s1.name_of(qi), s1.addr_of(qi), max_candidates=per_store_cap,
             )
             for r in rows:
-                r_int = int(r)
-                tid = store.id_of(r_int)
+                tid = store.id_of(int(r))
                 if tid in seen:
                     continue
                 seen.add(tid)
                 hit_ids.append(tid)
-                
-                cache_key = (si, r_int)
-                cached_target = target_cache.get(cache_key)
-                if cached_target is None:
-                    cached_target = _derive_target(store, r_int)
-                    target_cache[cache_key] = cached_target
-                tn, ta = cached_target
-                
+                tid_pos[tid] = (si, int(r))
+                tn, ta = _derive_target(store, int(r))
                 feat_rows.append(
                     pair_features(qn, qa, q_country, tn, ta,
-                                  targets.country_of(si, r_int), stats)
+                                  targets.country_of(si, int(r)), stats)
                 )
-                feat_owner.append((local, si, r_int))
+                feat_owner.append((local, si, int(r)))
 
         if not hit_ids:
             continue
@@ -568,7 +603,28 @@ def score_chunk(
             range(len(hit_ids)),
             key=lambda j: (-probs[j], hit_ids[j]),
         )
-        keep = [hit_ids[j] for j in order if probs[j] >= model.threshold]
+        ordered = [(hit_ids[j], float(probs[j]), X[j]) for j in order
+                   if probs[j] >= model.threshold]
+        keep = [cid for cid, _, _ in ordered]
+        keep_probs = [p for _, p, _ in ordered]
+        if keep and getattr(cfg, "evidence_gate", False):
+            from .postprocess import evidence_gate
+            X_keep = np.vstack([row for _, _, row in ordered])
+            keep = evidence_gate(keep, keep_probs, X_keep,
+                                 threshold=model.threshold,
+                                 gate_high=cfg.gate_high)
+            kept = set(keep)
+            keep_probs = [p for cid, p, _ in ordered if cid in kept]
+        if keep and getattr(cfg, "graph_expand", False):
+            extra = _graph_expand(
+                model, s1, qi, qn, qa, q_country, targets, tid_pos,
+                keep, keep_probs, seen, cfg,
+            )
+            for tid in extra:
+                if tid not in seen:
+                    seen.add(tid)
+                    keep.append(tid)
+                    cands[qi].append(tid)
         if keep:
             preds[qi] = keep
 
@@ -584,6 +640,59 @@ def score_chunk(
 # training on the labelled split
 # --------------------------------------------------------------------------
 
+def score_labeled_slice(
+    s1: RecordStore,
+    targets: TargetSide,
+    truth: dict[str, set[str]],
+    q_start: int,
+    q_end: int,
+    model: MatchingModel,
+    per_store_cap: int,
+) -> tuple[dict[str, list[tuple[str, float]]], dict[str, set[str]]]:
+    """Score Source 1 rows [q_start, q_end) -> ({eid: [(cid, prob)]}, truth).
+
+    Shared by validation (Pass B) and the held-out test slice (Pass C) so
+    both are scored identically; only what the caller does with the result
+    differs (threshold selection vs locked-threshold estimation).
+    """
+    scores: dict[str, list[tuple[str, float]]] = {}
+    y_true: dict[str, set[str]] = {}
+    for qi in range(q_start, q_end):
+        eid = s1.id_of(qi)
+        y_true[eid] = truth.get(eid, set())
+        qn, qa = _derive_query(s1, qi)
+        q_country = country_string(s1, qi)
+        scored: list[tuple[str, float]] = []
+        for si, (store, index) in enumerate(zip(targets.stores, targets.indexes)):
+            rows = index.candidates_for(
+                s1.name_of(qi), s1.addr_of(qi), max_candidates=per_store_cap,
+            )
+            if rows.size == 0:
+                continue
+            # Derive each target exactly once (~39 us wasted per pair when
+            # derived twice inside a comprehension -- dominated this pass).
+            xs: list[list[float]] = []
+            for r in rows:
+                r = int(r)
+                tn, ta = _derive_target(store, r)
+                xs.append(
+                    pair_features(qn, qa, q_country, tn, ta,
+                                  targets.country_of(si, r), None)
+                )
+            probs = model.predict_proba(np.asarray(xs, dtype=np.float32))
+            scored.extend(
+                (store.id_of(int(r)), float(p))
+                for r, p in zip(rows, probs)
+            )
+        # De-duplicate across the two sources, keep the best score.
+        best: dict[str, float] = {}
+        for cid, p in scored:
+            if cid not in best or p > best[cid]:
+                best[cid] = p
+        scores[eid] = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
+    return scores, y_true
+
+
 def train_on_train_split(
     train_dir: Path,
     cfg: PipelineConfig,
@@ -592,9 +701,11 @@ def train_on_train_split(
 ) -> tuple[dict, MatchingModel]:
     """Learn from ``dataset/train``, then release everything it allocated.
 
-    Returns ``(report, model)``.  Rows are split deterministically: the first
-    80% train, the last 20% are held out purely for threshold calibration so
-    the chosen threshold never sees data the model learned from.
+    Returns ``(report, model)``.  Rows are split deterministically into
+    three disjoint slices: fit (train_rows cap), validation / calibration
+    (calib_rows cap -- threshold and all selection decisions use this slice
+    only), and test (test_rows cap -- scored once with the locked threshold
+    for the unbiased estimate).
     """
     t0 = time.time()
     s1_path = train_dir / "train_source1.tsv"
@@ -609,15 +720,21 @@ def train_on_train_split(
     split_at = min(int(s1.n * 0.8), fit_cap)
     calib_cap = cfg.calib_rows if cfg.calib_rows and cfg.calib_rows > 0 else 10 ** 18
     calib_end = min(s1.n, split_at + calib_cap)
+    test_cap = cfg.test_rows if cfg.test_rows and cfg.test_rows > 0 else 0
+    test_end = min(s1.n, calib_end + test_cap)
     rng = random.Random(cfg.random_state)
 
     # Compute the row bounds *before* reading ground truth so only the ids we
     # will actually look up are retained.  An unfiltered load costs ~1.4 GB to
     # answer lookups for `calib_end` rows -- on 7.6 GB that is what pushes the
     # process out of physical memory and into paging.
-    keep = {s1.id_of(qi) for qi in range(calib_end)}
+    keep = {s1.id_of(qi) for qi in range(test_end)}
+    # GT is always scanned fully: its file order is NOT S1 order, so a
+    # line-limit would silently drop most fit-slice links (measured: fit
+    # falls back to heuristic on capped smoke runs). keep_ids already
+    # bounds memory to the slices actually used.
     truth = load_truth(
-        train_dir / "train_ground_truth.tsv", limit=limit, keep_ids=keep,
+        train_dir / "train_ground_truth.tsv", limit=None, keep_ids=keep,
     )
     if not truth:
         return {"mode": "skipped (no ground truth)"}, model
@@ -629,18 +746,39 @@ def train_on_train_split(
         f"{s1.n:,}", f"{targets.n_total:,}", f"{len(truth):,}",
     )
 
-    model.begin_streaming()
+    # Tree models (hgb / lightgbm / xgboost) cannot partial_fit: pairs are
+    # accumulated into a bounded, deterministically reservoir-sampled buffer
+    # and batch-fitted once. The SGD baseline path is untouched.
+    is_tree = cfg.model_type in MatchingModel.TREE_KINDS
+    if not is_tree:
+        model.begin_streaming()
     pos_seen = neg_seen = pairs_seen = 0
     X_batch: list[np.ndarray] = []
     y_batch: list[int] = []
+    X_buf: list[np.ndarray] = []
+    y_buf: list[int] = []
+    n_seen_res = 0
 
     def flush() -> None:
-        nonlocal X_batch, y_batch
+        nonlocal X_batch, y_batch, n_seen_res
         if not y_batch:
             return
         X = np.vstack(X_batch)
         y = np.asarray(y_batch, dtype=np.int64)
-        model.partial_fit(X, y)
+        if is_tree:
+            cap = cfg.gbm_max_pairs if cfg.gbm_max_pairs > 0 else 10 ** 18
+            for xi, yi in zip(X, y):
+                n_seen_res += 1
+                if len(y_buf) < cap:
+                    X_buf.append(xi)
+                    y_buf.append(int(yi))
+                else:
+                    j = rng.randrange(n_seen_res)
+                    if j < cap:
+                        X_buf[j] = xi
+                        y_buf[j] = int(yi)
+        else:
+            model.partial_fit(X, y)
         X_batch, y_batch = [], []
 
     per_store_cap = max(4, cfg.max_candidates_per_row // max(len(targets.stores), 1))
@@ -648,10 +786,17 @@ def train_on_train_split(
     neg_pairs: list[tuple[int, int, int]] = []
 
     # ---- pass A: fit on the first 80% of Source 1 ------------------------
+    # truth_total counts every ground-truth link in the fit slice, so the
+    # blocking recall ceiling (retrieved true pairs / all true pairs) is
+    # reported for free alongside fitting. pos_pairs cannot double-count:
+    # candidate rows are unique per store and S2/S3 id namespaces are
+    # disjoint.
+    truth_total = 0
     for qi in range(split_at):
         truth_ids = truth.get(s1.id_of(qi), set())
         if not truth_ids:
             continue
+        truth_total += len(truth_ids)
         for si, (store, index) in enumerate(zip(targets.stores, targets.indexes)):
             rows = index.candidates_for(
                 s1.name_of(qi), s1.addr_of(qi), max_candidates=per_store_cap,
@@ -681,6 +826,31 @@ def train_on_train_split(
         pos_pairs, neg_pairs = [], []
     flush()
 
+    report: dict = {
+        "n_positive_pairs": pos_seen,
+        "n_negative_pairs": neg_seen,
+        "n_total_pairs": pairs_seen,
+        "blocking_recall_fit": round(pos_seen / max(truth_total, 1), 5),
+        "truth_links_fit": truth_total,
+    }
+
+    if is_tree:
+        tau = pos_seen / max(pos_seen + neg_seen, 1)
+        if y_buf:
+            X_arr = np.vstack(X_buf)
+        else:
+            # No retrieved positives (e.g. capped smoke runs whose GT slice
+            # holds no fit-range links): let fit_batch take the documented
+            # insufficient-data fallback instead of crashing vstack.
+            X_arr = np.zeros((0, N_FEATURES), dtype=np.float64)
+        fit_rep = model.fit_batch(
+            X_arr, np.asarray(y_buf, dtype=np.int64), tau=tau,
+        )
+        report.update({f"tree_{k}": v for k, v in fit_rep.items()
+                       if k in ("n_samples", "n_positive")})
+        report["tau"] = tau
+        report["buffer_n"] = len(y_buf)
+
     # Persist the fitted weights before calibration.  Pass B is the phase that
     # has already been lost once to a killed run, and re-fitting costs ~20
     # minutes -- if calibration later raises, run_test picks this up instead
@@ -692,6 +862,13 @@ def train_on_train_split(
         log.info("Fitted model checkpointed to %s", ckpt)
     except Exception as exc:                       # noqa: BLE001
         log.warning("Could not checkpoint fitted model: %s", exc)
+    save_path = (cfg.extra or {}).get("save_model")
+    if save_path:
+        try:
+            model.save(save_path)
+            log.info("Saved fitted model to %s", save_path)
+        except Exception as exc:                   # noqa: BLE001
+            log.warning("Could not save model to %s: %s", save_path, exc)
 
     report = {
         "mode": model.kind,
@@ -699,51 +876,20 @@ def train_on_train_split(
         "n_positive_pairs": pos_seen,
         "n_negative_pairs": neg_seen,
         "n_total_pairs": pairs_seen,
+        "blocking_recall_fit": round(pos_seen / max(truth_total, 1), 5),
+        "truth_links_fit": truth_total,
     }
     log.info(
         "Pass A done: %s positive / %s negative pairs",
         f"{pos_seen:,}", f"{neg_seen:,}",
     )
 
-    # ---- pass B: calibrate the threshold on the held-out 20% -------------
+    # ---- pass B: calibrate the threshold on the validation slice --------
+    # The threshold (and all model/config selection) uses this slice only.
     if cfg.calibrate_threshold and calib_end > split_at:
-        val_scores: dict[str, list[tuple[str, float]]] = {}
-        y_true_val: dict[str, set[str]] = {}
-        for qi in range(split_at, calib_end):
-            eid = s1.id_of(qi)
-            y_true_val[eid] = truth.get(eid, set())
-            qn, qa = _derive_query(s1, qi)
-            q_country = country_string(s1, qi)
-            scored: list[tuple[str, float]] = []
-            for si, (store, index) in enumerate(zip(targets.stores, targets.indexes)):
-                rows = index.candidates_for(
-                    s1.name_of(qi), s1.addr_of(qi), max_candidates=per_store_cap,
-                )
-                if rows.size == 0:
-                    continue
-                # Derive each target exactly once.  The previous form called
-                # `_derive_target(...)` twice inside the comprehension --
-                # ~39 us wasted on every pair, which dominated this pass.
-                xs: list[list[float]] = []
-                for r in rows:
-                    r = int(r)
-                    tn, ta = _derive_target(store, r)
-                    xs.append(
-                        pair_features(qn, qa, q_country, tn, ta,
-                                      targets.country_of(si, r), None)
-                    )
-                probs = model.predict_proba(np.asarray(xs, dtype=np.float32))
-                scored.extend(
-                    (store.id_of(int(r)), float(p))
-                    for r, p in zip(rows, probs)
-                )
-            # De-duplicate across the two sources, keep the best score.
-            best: dict[str, float] = {}
-            for cid, p in scored:
-                if cid not in best or p > best[cid]:
-                    best[cid] = p
-            val_scores[eid] = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
-
+        val_scores, y_true_val = score_labeled_slice(
+            s1, targets, truth, split_at, calib_end, model, per_store_cap,
+        )
         report["n_val_rows"] = calib_end - split_at
         report["calibration"] = calibrate(val_scores, y_true_val, cfg)
         model.threshold = float(report["calibration"]["threshold"])
@@ -755,6 +901,26 @@ def train_on_train_split(
     else:
         model.threshold = model.cfg.heuristic_threshold
         report["threshold"] = model.threshold
+
+    # ---- pass C: unbiased estimate on the held-out test slice -------------
+    # Scored ONCE with the locked validation-chosen threshold. Never used
+    # for fitting, threshold selection, or model/config decisions.
+    if test_end > calib_end:
+        test_scores, y_true_test = score_labeled_slice(
+            s1, targets, truth, calib_end, test_end, model, per_store_cap,
+        )
+        test_f05, test_pred = f05_at_threshold(
+            test_scores, y_true_test, float(model.threshold))
+        test_p, test_r = macro_pr(y_true_test, test_pred)
+        report["n_test_rows"] = test_end - calib_end
+        report["test_macro_f05"] = round(test_f05, 5)
+        report["test_precision"] = round(test_p, 5)
+        report["test_recall"] = round(test_r, 5)
+        log.info(
+            "Test slice macro F_0.5=%s (P=%s R=%s, thr=%.2f, locked)",
+            report["test_macro_f05"], report["test_precision"],
+            report["test_recall"], model.threshold,
+        )
 
     # ---- release everything ----------------------------------------------
     report["seconds"] = round(time.time() - t0, 2)
@@ -806,13 +972,20 @@ def calibrate(
     if not scores or not truth:
         return {"threshold": cfg.threshold, "val_f05": None, "curve": []}
     best_thr, best_score = cfg.threshold, -1.0
+    best_pred: dict[str, set[str]] = {}
     curve = []
     for thr in cfg.threshold_grid:
-        score, _ = f05_at_threshold(scores, truth, float(thr))
-        curve.append({"threshold": float(thr), "f05": round(score, 5)})
+        score, y_pred = f05_at_threshold(scores, truth, float(thr))
+        p, r = macro_pr(truth, y_pred)
+        curve.append({"threshold": float(thr), "f05": round(score, 5),
+                      "precision": round(p, 5), "recall": round(r, 5)})
         if score > best_score + 1e-12:
             best_score, best_thr = score, float(thr)
-    return {"threshold": best_thr, "val_f05": round(best_score, 5), "curve": curve}
+            best_pred = y_pred
+    bp, br = macro_pr(truth, best_pred)
+    return {"threshold": best_thr, "val_f05": round(best_score, 5),
+            "val_precision": round(bp, 5), "val_recall": round(br, 5),
+            "curve": curve}
 
 
 # --------------------------------------------------------------------------
@@ -834,7 +1007,9 @@ def run_train_eval(
     report["threshold"] = model.threshold
     report["model_kind"] = model.kind
     report.setdefault("val_macro_f05", None)
-    log.info("train-eval | val macro F_0.5 = %s", report.get("val_macro_f05"))
+    report.setdefault("test_macro_f05", None)
+    log.info("train-eval | val macro F_0.5 = %s | test macro F_0.5 = %s",
+             report.get("val_macro_f05"), report.get("test_macro_f05"))
     return report
 
 

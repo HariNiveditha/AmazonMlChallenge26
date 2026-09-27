@@ -84,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--df-cap", type=int, default=60,
                     help="Skip a blocking key shared by more than this many "
                          "records; bounds candidate fan-out.")
+    ap.add_argument("--phonetic-keys", action="store_true",
+                    help="Add Soundex phonetic blocking keys (recall lever).")
+    ap.add_argument("--per-token-keys", action="store_true",
+                    help="Add per-token name keys (t:) + address-first keys (x:) "
+                         "for NO_SHARED_KEY recall misses.")
+    ap.add_argument("--soft-cap", action="store_true",
+                    help="Whole-group budget boundaries instead of row-id "
+                         "truncation (measured recall lever).")
+    ap.add_argument("--minhash-lsh", action="store_true",
+                    help="Add MinHash LSH band keys (approximate-name recall).")
     ap.add_argument("--max-candidates", type=int, default=80,
                     help="Hard cap on candidates per Source 1 row. Blocking "
                          "sets the recall ceiling -- raise this first if "
@@ -95,8 +105,34 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--train-rows", type=int, default=300_000,
                     help="Source 1 rows used to fit the model (0 = all). "
                          "Cost is linear in rows.")
+    ap.add_argument("--model-type", choices=["sgd", "hgb", "lightgbm", "xgboost", "catboost"],
+                    default="sgd",
+                    help="Matcher family: sgd = streaming baseline (default, "
+                         "unchanged); hgb/lightgbm/xgboost/catboost = batch tree "
+                         "models on a bounded pair buffer (all single-threaded).")
+    ap.add_argument("--gbm-max-pairs", type=int, default=200_000,
+                    help="Max pairs buffered for tree-model batch fitting.")
+    ap.add_argument("--prior-correct", action="store_true",
+                    help="Apply choice-based-sampling prior correction to "
+                         "tree-model probabilities (tau/y_bar from training).")
+    ap.add_argument("--evidence-gate", action="store_true",
+                    help="Two-stage singleton guard: medium-confidence rows "
+                         "need postcode or strong-name+country evidence.")
+    ap.add_argument("--gate-high", type=float, default=0.90,
+                    help="Best-prob at/above this bypasses the evidence gate.")
+    ap.add_argument("--graph-expand", action="store_true",
+                    help="One-hop evidence-gated expansion for blocking "
+                         "misses (classifier still decides).")
+    ap.add_argument("--graph-leg-thr", type=float, default=0.90,
+                    help="Only accepted legs this strong seed expansion.")
+    ap.add_argument("--graph-max-expand", type=int, default=5,
+                    help="Max new accepts per Source 1 row from expansion.")
     ap.add_argument("--calib-rows", type=int, default=50_000,
                     help="Held-out rows used to pick the threshold (0 = all).")
+    ap.add_argument("--test-rows", type=int, default=30_000,
+                    help="Held-out rows after the calib slice, scored once "
+                         "with the locked threshold for an unbiased "
+                         "estimate (0 = disable).")
     ap.add_argument("--threshold", type=float, default=None,
                     help="Decision threshold (default: calibrated or 0.65).")
     ap.add_argument("--no-calibrate", action="store_true",
@@ -114,13 +150,26 @@ def build_parser() -> argparse.ArgumentParser:
 def config_from_args(args: argparse.Namespace) -> PipelineConfig:
     cfg = PipelineConfig()
     cfg.df_cap = args.df_cap
+    cfg.phonetic_keys = args.phonetic_keys
+    cfg.per_token_keys = args.per_token_keys
+    cfg.soft_cap = args.soft_cap
+    cfg.minhash_lsh = args.minhash_lsh
     cfg.max_candidates_per_row = args.max_candidates
     cfg.query_chunk = args.query_chunk
     if args.workers:
         cfg.workers = args.workers
     cfg.train_rows = args.train_rows
     cfg.calib_rows = args.calib_rows
+    cfg.test_rows = args.test_rows
     cfg.random_state = args.seed
+    cfg.model_type = args.model_type
+    cfg.gbm_max_pairs = args.gbm_max_pairs
+    cfg.prior_correct = args.prior_correct
+    cfg.evidence_gate = args.evidence_gate
+    cfg.gate_high = args.gate_high
+    cfg.graph_expand = args.graph_expand
+    cfg.graph_leg_thr = args.graph_leg_thr
+    cfg.graph_max_expand = args.graph_max_expand
     cfg.verbose = not args.quiet
     cfg.calibrate_threshold = not args.no_calibrate
     if args.threshold is not None:

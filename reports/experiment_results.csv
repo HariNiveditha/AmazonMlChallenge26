@@ -1,0 +1,42 @@
+experiment_id,timestamp,model,blocking,features,df_cap,max_candidates,workers,query_chunk,candidate_recall,candidates_per_entity,precision,recall,macro_f0_5,threshold,runtime,peak_ram,status,notes
+sgd_baseline,,sgd_logistic_regression,sparse-packed-crc32,37-ratio,60,80,,5000,0.659,,0.82258,0.57589,0.72699,0.88,1751.6,,OK,
+hgb,,hgb,sparse-packed-crc32,37-ratio,60,80,,5000,,,,,,,1360.2,,FAILED,"9, in run_train_eval |     report, model = train_on_train_split(train_dir, cfg, model, limit) |                     ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ |   File ""C:\Users\BIT\OneDrive\Documents\Desktop\amazon ml\AmazonMlChallenge26-main\code\business_entity_resolution\src\pipeline.py"", line 830, in train_on_train_split |     report.update({f""tree_{k}"": v for k, v in fit_rep.items() |     ^^^^^^ | UnboundLocalError: cannot access local variable 'report' where it is not associated with a value | "
+hgb2,,tree_hgb,sparse-packed-crc32,37-ratio,60,80,,5000,0.659,,0.86118,0.61893,0.77008,0.94,1957.4,,OK,
+lightgbm2,,tree_lightgbm,sparse-packed-crc32,37-ratio,60,80,,5000,0.659,,0.86384,0.62138,0.77275,0.94,1454.7,,OK,
+xgboost2,,tree_xgboost,sparse-packed-crc32,37-ratio,60,80,,5000,0.659,,0.86116,0.61781,0.76958,0.94,1622.3,,OK,
+caps_80_60,,blocking-only,sparse-packed-crc32,37-ratio,60,80,,5000,0.6578,37.76,,,,,,,OK,10k val-subset recall; query 2s
+caps_80_120,,blocking-only,sparse-packed-crc32,37-ratio,120,80,,5000,0.59055,49.55,,,,,,,OK,"df120 HURTS recall: noisy groups flood budget, truncation by row-id drops good pairs"
+caps_120_60,,blocking-only,sparse-packed-crc32,37-ratio,60,120,,5000,0.69173,43.68,,,,,,,OK,
+caps_120_120,,blocking-only,sparse-packed-crc32,37-ratio,120,120,,5000,0.64694,64.4,,,,,,,OK,
+caps_150_60,,blocking-only,sparse-packed-crc32,37-ratio,60,150,,5000,0.69859,45.18,,,,,,,OK,
+caps_150_120,,blocking-only,sparse-packed-crc32,37-ratio,120,150,,5000,0.67608,72.91,,,,,,,OK,
+caps_200_60,,blocking-only,sparse-packed-crc32,37-ratio,60,200,,5000,0.70247,46.21,,,,,,,OK,best cheap recall; +4.5pp for +8 cands/row
+caps_200_120,,blocking-only,sparse-packed-crc32,37-ratio,120,200,,5000,0.70485,82.9,,,,,,,OK,recall ~flat vs 200/60 at 1.8x candidates: rejected
+autopsy_baseline,,blocking-only,sparse-packed-crc32,37-ratio,60,80,,5000,0.6592,,,,,,,,OK,"miss split: NO_SHARED_KEY 873 (12.5%), DF_CAPPED 1181 (16.9%), BUDGET_CUT 333 (4.8%) of 7004 pairs"
+dense_slice_v1,,dense-minilm-k80,dense-minilm-k80,37-ratio,,80,,5000,,,,,,,479,,FAILED,"truth sampling bug: early-break GT scan vs unaligned file order -> 35 pairs, recalls 0.0 (invalid). Fixed to full scan + embedding cache."
+dense_slice_v2,,dense-minilm-k80,dense-minilm-k80,37-ratio,,80,,5000,0.9667,80,,,,,33,,OK,"slice-resident pairs n=60 (coverage 0.86%): sparse 0.7333, dense 0.9667, union 0.9667. Direction solid (McNemar 14-0); magnitude needs bigger slice. Full-corpus: 18GB, infeasible as flat index."
+phonetic_keys,,blocking-only+phonetic,sparse-packed-crc32,37-ratio,60/120,80-200,,5000,0.7025,46.25,,,,,814,,OK,REJECTED: recall identical to non-phonetic at every combo (e.g. 200/60: 0.70250 vs 0.70247). y: keys too common -> all df-capped. +27% build time for zero gain.
+gate_graph_v1,,heuristic-fallback,sparse-packed-crc32,37-ratio,60,80,,5000,,,,,,0.96,261,,FAILED,"INVALID: limit-truncated GT starved fit (heuristic fallback, thr 0.96) + limit-truncated targets broke residency -> arms 0.057. Fixed pipeline GT scan + full-index eval script."
+flags_baseline_090,,tree_lightgbm-slice,sparse-packed-crc32,37-ratio,60,80,,5000,,,0.8594,0.61966,0.77035,0.9,845,,OK,slice eval; gate/graph vacuous here (thr==gate_high): see flags_gate_070 run
+flags_gate_090,,tree_lightgbm-slice,sparse-packed-crc32,37-ratio,60,80,,5000,,,0.8594,0.61966,0.77035,0.9,845,,OK,"identical output to baseline: mid-band empty when thr==gate_high. INCONCLUSIVE, rerun at 0.70"
+flags_graph_090,,tree_lightgbm-slice,sparse-packed-crc32,37-ratio,60,80,,5000,,,0.8594,0.61966,0.77035,0.9,845,,OK,"identical output: no above-threshold expansion fired. INCONCLUSIVE, rerun at 0.70 with diff counters"
+flags_gate_070,,tree_lightgbm-slice,sparse-packed-crc32,37-ratio,60,80,,5000,,,0.79776,0.64381,0.73802,0.7,344,,OK,"vs baseline 0.73706: 157 rows changed, 175 dropped, 0 added; singleton FP 174->142. Helps only below 0.90 thresholds; vacuous at selected 0.94. Default OFF."
+flags_graph_070,,tree_lightgbm-slice,sparse-packed-crc32,37-ratio,60,80,,5000,,,0.79713,0.6423,0.73706,0.7,344,,OK,"0 rows changed, 0 added: no above-threshold expansion fired. REJECTED (kept in code, off)."
+cap200_lgbm,,tree_lightgbm,sparse-packed-crc32,37-ratio,60,200,,5000,0.70387,,0.87734,0.65379,0.7942,0.96,1561.31,,OK,NEW BEST. Curve still rising at grid edge 0.96 -> grid extended to 0.98. --save-model was dead flag (never consumed); wired to persist fitted model.
+final_test_v1,,tree_lightgbm,sparse-packed-crc32,37-ratio,60,200,,5000,,,,,0.7942,0.96,,,FAILED,"Presumed OOM mid-scoring (~125/347 chunks, no traceback, no reboot, 12 workers x 200-cap batches exceeded avail RAM). Train phase had reproduced val 0.7942; winner_model.json+booster persisted before death. Mitigation: workers 6, query-chunk 2500."
+final_test_v2,,tree_lightgbm,sparse-packed-crc32,37-ratio,60,200,,5000,,,,,,,,,FAILED,"Second mid-scoring death (~444/694 chunks, same signature). Shared state survived (model+booster+indexes+444 contiguous chunks). Resuming missing 250 chunks single-process via resume_final.py."
+final_inference_resumed,2026-09-27T14:20:00+00:00,tree_lightgbm,sparse-packed-crc32,37-ratio,60,200,6then1(resume),2500,,46.05,,,,0.96,,,OK,694/694 chunks (444+250 resume); 1570826 matched/161718 singletons; 79779361 pairs; audit+validators PASS
+minhash_lsh_sweep,2026-09-27T14:30:00+00:00,blocking-only+minhash,sparse-packed+minhash16x4,37-ratio,60/120,80-200,,,,,,,,,,,INTERRUPTED,Halted in index build on user stop order; unit tests (29) cover determinism/additivity. Future work.
+,,blocking-only,,,p/T:500 i:200,80/200,,,0.70247,,,,,,,,OK,REJECTED: identical to global60 at all variants. DF_CAPPED misses share name/addr keys; raising those caps floods budget.
+,,blocking-only,,,p/T:1000 i:500 n/f:120,80/200,,,0.70247,,,,,,,,OK,REJECTED: identical recall. Sparse ceiling 0.702 at caps 200 confirmed.
+,,blocking-only+pertoken,,,60,80/200,,,0.70247,,,,,,,,OK,REJECTED: zero recall gain vs baseline (0.65774 vs 0.65780 at cap80; 0.70247 vs 0.70247 at cap200). Common tokens df-capped; rare-token pairs already covered by l:/f:/n: keys. Sparse ceiling 0.702 confirmed.
+,,tree_catboost,,,60,200,,,0.70387,,,,,0.94,,,OK,Below lightgbm-200 (0.7942). Rejected as champion; 4th GBM family measured.
+,,blocking-only,,,60,80,,,0.70092,,,,,,,,OK,Whole-group boundaries: +4.3pp vs hard-80 at +5 cands/row. Implemented as --soft-cap (default off); F0.5 equivalence to hard-200 unvalidated -> not in final config.
+,,blocking-only,,,60,200,,,0.70307,,,,,,,,OK,Flat vs soft-80: budget beyond ~80 is noise.
+,,tree_lightgbm-saved,,,60,200,,,,,,,,0.96,,,OK,US-only optimum 0.96. Val-slice decomposition.
+,,tree_lightgbm-saved,,,60,200,,,,,,,,0.92,,,OK,"India-only optimum 0.92. Recall gap (0.54 vs US 0.74) is blocking/model quality, not threshold: combined country thresholds gain only +0.001. REJECTED for inference."
+,,blocking-only,,,60,300,,,0.70307,,,,,,,,OK,"Flat vs 200: budget exhausted, no new groups. Candidate budget is NOT the constraint."
+,,blocking-only,,,60,500,,,0.70307,,,,,,,,OK,Identical to 300. Sparse recall ceiling 0.703 CONFIRMED FINAL.
+,,tree_lightgbm-saved,,,60,200,,,,,,,,0.96,,,OK,"0.96 optimal (0.95: 0.79532, 0.97: 0.79502, 0.98: 0.792). No change."
+,,tree_lightgbm-saved,,,60,200,,,,,,,,0.96,,,OK,REJECTED: precision collapse 0.878->0.832. Cheap-evidence rescue adds more FPs than TPs.
+,,tree_lightgbm-saved,,,60,200,,,,,,,,0.96,,,OK,No-op: postcode/phone-gated rescue fires on ~nobody. REJECTED.

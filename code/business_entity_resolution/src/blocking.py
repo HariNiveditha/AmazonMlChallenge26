@@ -38,7 +38,7 @@ import logging
 
 import numpy as np
 
-from .config import NAME_ABBREVS, PipelineConfig
+from .config import ADDRESS_ABBREVS, NAME_ABBREVS, REGION_ABBREVS, STOP_TOKENS, PipelineConfig
 from .normalize import dedupe_preserve_order, expand_tokens, strip_suffixes, tokenize
 from .store import RecordStore, crc32, record_keys
 
@@ -64,15 +64,123 @@ def _name_grams(sorted_core: str) -> list[bytes]:
     return grams
 
 
-def keys_for(name_cleaned: str, addr_cleaned: str) -> list[bytes]:
-    """All blocking keys for one record: exact structure + sampled shingles."""
+def soundex(word: str) -> str:
+    """American Soundex code (stdlib-only, deterministic).
+
+    Collapses phonetically similar tokens (Smith/Smyth -> S530) so a
+    spelling-variant pair can still share a blocking key. Used only when
+    the ``phonetic_keys`` option is on.
+    """
+    if not word:
+        return ""
+    w = word.upper()
+    first = w[0]
+    table = {"BFPV": "1", "CGJKQSXZ": "2", "DT": "3", "L": "4",
+             "MN": "5", "R": "6"}
+    digits = []
+    for ch in w[1:]:
+        d = ""
+        for letters, code in table.items():
+            if ch in letters:
+                d = code
+                break
+        digits.append(d)
+    # Drop vowels/H/W (empty) and collapse adjacent duplicates.
+    collapsed = []
+    for d in digits:
+        if d and (not collapsed or d != collapsed[-1]):
+            collapsed.append(d)
+    return (first + "".join(collapsed))[:4].ljust(4, "0")
+
+
+def keys_for(name_cleaned: str, addr_cleaned: str, *,
+             phonetic: bool = False, minhash: bool = False,
+             per_token: bool = False) -> list[bytes]:
+    """All blocking keys: exact structure + sampled shingles (+ opt-ins)."""
     keys = record_keys(name_cleaned, addr_cleaned)
     core = strip_suffixes(
         dedupe_preserve_order(expand_tokens(tokenize(name_cleaned), NAME_ABBREVS))
     )
     sorted_core = " ".join(sorted(core))
     keys.extend(_name_grams(sorted_core))
+    if phonetic:
+        content = [t for t in core if t not in STOP_TOKENS] or core
+        if content:
+            keys.append(b"y:" + soundex(content[0]).encode())
+            longest = max(content, key=len)
+            if len(longest) >= 5:
+                keys.append(b"y:" + soundex(longest).encode())
+    if minhash:
+        keys.extend(minhash_bands(sorted_core))
+    if per_token:
+        content = [t for t in core if t not in STOP_TOKENS] or core
+        seen = set()
+        for tok in content:
+            if len(tok) >= 4 and tok not in seen:
+                seen.add(tok)
+                keys.append(b"t:" + tok.encode())
+        a_toks = tokenize(addr_cleaned)
+        a_exp = dedupe_preserve_order(
+            expand_tokens(expand_tokens(a_toks, ADDRESS_ABBREVS), REGION_ABBREVS)
+        )
+        a_content = [t for t in a_exp if t not in STOP_TOKENS]
+        if len(a_content) >= 2:
+            keys.append(b"x:" + (a_content[0] + "|" + a_content[1]).encode())
     return keys
+
+
+# 64 MinHash functions over char 3/4-grams, 16 bands x 4 rows. Coefficients
+# drawn once from a fixed seed so signatures are deterministic across
+# processes and runs (crc32 would collide per-key; the linear family below
+# is the standard MinHash construction).
+_MH_P = (1 << 61) - 1
+_MH_A: tuple[int, ...] = ()
+_MH_B: tuple[int, ...] = ()
+
+
+def _mh_params() -> tuple[tuple[int, ...], tuple[int, ...]]:
+    global _MH_A, _MH_B
+    if not _MH_A:
+        import random
+        rng = random.Random(0xBE92)
+        _MH_A = tuple(rng.randrange(1, _MH_P) for _ in range(64))
+        _MH_B = tuple(rng.randrange(0, _MH_P) for _ in range(64))
+    return _MH_A, _MH_B
+
+
+def minhash_bands(sorted_core: str) -> list[bytes]:
+    """16 LSH band keys for approximate name similarity (opt-in).
+
+    Near-duplicate names share bands with high probability while unrelated
+    names (near-)never do; the query-time df_cap still bounds fan-out, so
+    over-popular bands drop out automatically like any other key.
+    """
+    text = sorted_core.strip()
+    if len(text) < 4:
+        return []
+    shingles: set[bytes] = set()
+    raw = text.encode()
+    for n in (3, 4):
+        for i in range(len(raw) - n + 1):
+            shingles.add(raw[i:i + n])
+            if len(shingles) >= 400:
+                break
+    if not shingles:
+        return []
+    a_s, b_s = _mh_params()
+    sig = []
+    for a, b in zip(a_s, b_s):
+        m = _MH_P
+        for s in shingles:
+            h = (a * (crc32(s) or 1) + b) % _MH_P
+            if h < m:
+                m = h
+        sig.append(m)
+    out = []
+    for band in range(16):
+        rows = sig[band * 4:(band + 1) * 4]
+        out.append(b"h:%02d:" % band + b".".join(f"{v:016x}".encode() for v in rows))
+    return out
 
 
 # Batch size for the streaming build.  ~4M postings is ~32 MB of packed
@@ -120,7 +228,10 @@ class KeyIndex:
                 pending: list[int] = []
                 append = pending.append
                 for i in range(n):
-                    for k in keys_for(name_of(i), addr_of(i)):
+                    for k in keys_for(name_of(i), addr_of(i),
+                                      phonetic=cfg.phonetic_keys,
+                                      minhash=cfg.minhash_lsh,
+                                      per_token=cfg.per_token_keys):
                         append((crc32(k) << 32) | i)
                     if len(pending) >= FLUSH_POSTINGS:
                         fh.write(np.asarray(pending, dtype=np.uint64).tobytes())
@@ -187,7 +298,10 @@ class KeyIndex:
         selective evidence available and therefore the least likely to flood
         the budget with noise.
         """
-        keys = keys_for(name_cleaned, addr_cleaned)
+        keys = keys_for(name_cleaned, addr_cleaned,
+                        phonetic=self.cfg.phonetic_keys,
+                        minhash=self.cfg.minhash_lsh,
+                        per_token=self.cfg.per_token_keys)
         if not keys:
             return _EMPTY_IDX
 
@@ -201,6 +315,22 @@ class KeyIndex:
 
         if rarest_first and len(groups) > 1:
             groups.sort(key=lambda a: a.size)
+
+        if getattr(self.cfg, "soft_cap", False):
+            # Whole-group boundaries (PDF v7 behavior): keep adding groups
+            # while under budget; groups that fit are kept whole instead of
+            # truncating the union by row id. Measured: soft-80 recall
+            # 0.7009 vs hard-80 0.6578 at similar candidate volume.
+            kept: list = []
+            total = 0
+            for g in groups:
+                if total >= max_candidates:
+                    break
+                kept.append(g)
+                total += int(g.size)
+            if not kept:
+                return _EMPTY_IDX
+            return np.unique(np.concatenate(kept))
 
         # Concatenate then dedupe, preferring rarer groups first.
         merged = np.concatenate(groups)
